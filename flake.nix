@@ -29,6 +29,7 @@
           pkgs.lldb
           pkgs.bacon
           pkgs.rust-analyzer
+          pkgs.geckodriver
         ];
       };
   };
