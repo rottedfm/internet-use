@@ -1,4 +1,7 @@
-use fantoccini::{Client, ClientBuilder, wd::Capabilities};
+use fantoccini::{
+    Client, ClientBuilder,
+    wd::{Capabilities, WindowHandle},
+};
 use serde::Serialize;
 use serde_json::json;
 use thiserror::Error;
@@ -9,10 +12,10 @@ pub enum BrowserError {
     #[error("WebDriver connection failed: {0}")]
     ConnectionError(String),
 
-    #[error("Browser operation faild: {0}")]
+    #[error("Browser operation failed: {0}")]
     OperationError(String),
 
-    #[error("Invaild browser configuration: {0}")]
+    #[error("Invalid browser configuration: {0}")]
     ConfigError(String),
 }
 
@@ -71,13 +74,14 @@ impl BrowserOptions {
 pub struct BrowserClient {
     client: Client,
     options: BrowserOptions,
+    current_tab: Option<WindowHandle>,
+    action_retry_count: usize,
 }
 
 impl BrowserClient {
     pub async fn connect(options: BrowserOptions) -> Result<Self, BrowserError> {
         let mut caps = Capabilities::new();
 
-        // Firefox-specific options
         let mut firefox_options = json!({
             "args": if options.headless {
                 vec!["-headless"]
@@ -86,7 +90,6 @@ impl BrowserClient {
             }
         });
 
-        // Add user agent if specifed
         if let Some(ua) = &options.user_agent {
             firefox_options["prefs"] = json!({
                 "general.useragent.override": ua
@@ -95,7 +98,6 @@ impl BrowserClient {
 
         caps.insert("moz:firefoxOptions".to_string(), firefox_options);
 
-        // Configure proxy
         if let Some(proxy) = &options.proxy {
             caps.insert(
                 "proxy".to_string(),
@@ -107,14 +109,12 @@ impl BrowserClient {
             );
         }
 
-        // Build client with capabilities
         let client = ClientBuilder::native()
             .capabilities(caps)
             .connect("http://localhost:4444")
             .await
             .map_err(|e| BrowserError::ConnectionError(e.to_string()))?;
 
-        // Set window size
         if let Some((width, height)) = options.window_size {
             client
                 .set_window_size(width, height)
@@ -122,16 +122,37 @@ impl BrowserClient {
                 .map_err(|e| BrowserError::OperationError(e.to_string()))?;
         }
 
-        Ok(Self { client, options })
+        let handles = client
+            .windows()
+            .await
+            .map_err(|e| BrowserError::OperationError(e.to_string()))?;
+
+        let current_tab = handles.first().cloned();
+
+        Ok(Self {
+            client,
+            options,
+            current_tab,
+            action_retry_count: 3,
+        })
     }
 
-    pub async fn search_duckduckgo(&mut self, query: &str) -> Result<(), BrowserError> {
-        let url = format!("https://duckduckgo.com/?q={}", query);
-
-        self.client
-            .goto(url.as_str())
-            .await
-            .map_err(|e| BrowserError::OperationError(e.to_string()))
+    async fn retry<F, Fut, T>(&self, mut f: F) -> Result<T, BrowserError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, BrowserError>>,
+    {
+        let mut attempts = 0;
+        loop {
+            match f().await {
+                Ok(result) => return Ok(result),
+                Err(e) if attempts < self.action_retry_count => {
+                    attempts += 1;
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     pub async fn navigate(&mut self, url: &str) -> Result<(), BrowserError> {
@@ -139,6 +160,211 @@ impl BrowserClient {
             .goto(url)
             .await
             .map_err(|e| BrowserError::OperationError(e.to_string()))
+    }
+
+    pub async fn search_duckduckgo(&mut self, query: &str) -> Result<(), BrowserError> {
+        let url = format!("https://duckduckgo.com/?q={}", query);
+        self.navigate(&url).await
+    }
+
+    pub async fn back(&mut self) -> Result<(), BrowserError> {
+        self.client
+            .back()
+            .await
+            .map_err(|e| BrowserError::OperationError(e.to_string()))
+    }
+
+    pub async fn forward(&mut self) -> Result<(), BrowserError> {
+        self.client
+            .forward()
+            .await
+            .map_err(|e| BrowserError::OperationError(e.to_string()))
+    }
+
+    pub async fn wait_for_element(&mut self, element: &str) -> Result<bool, BrowserError> {
+        match self
+            .client
+            .wait()
+            .for_element(fantoccini::Locator::Css(element))
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        }
+    }
+
+    pub async fn click_element(&mut self, selector: &str) -> Result<(), BrowserError> {
+        self.wait_for_tab_ready(selector).await?;
+
+        self.retry(|| async {
+            let el = self
+                .client
+                .wait()
+                .for_element(fantoccini::Locator::Css(selector))
+                .await
+                .map_err(|e| {
+                    BrowserError::OperationError(format!("Failed to find '{}': {}", selector, e))
+                })?;
+
+            el.click().await.map_err(|e| {
+                BrowserError::OperationError(format!("Click failed '{}': {}", selector, e))
+            })
+        })
+        .await
+    }
+
+    pub async fn send_keys_to_element(
+        &mut self,
+        selector: &str,
+        text: &str,
+    ) -> Result<(), BrowserError> {
+        self.wait_for_tab_ready(selector).await?;
+
+        self.retry(|| async {
+            let el = self
+                .client
+                .wait()
+                .for_element(fantoccini::Locator::Css(selector))
+                .await
+                .map_err(|e| {
+                    BrowserError::OperationError(format!("Failed to find '{}': {}", selector, e))
+                })?;
+
+            el.send_keys(text).await.map_err(|e| {
+                BrowserError::OperationError(format!("Send keys failed '{}': {}", selector, e))
+            })
+        })
+        .await
+    }
+
+    pub async fn source(&mut self) -> Result<String, BrowserError> {
+        self.client
+            .source()
+            .await
+            .map_err(|e| BrowserError::OperationError(e.to_string()))
+    }
+
+    pub async fn open_tab(&mut self) -> Result<(), BrowserError> {
+        self.client
+            .execute("window.open('about:blank', '_blank');", vec![])
+            .await
+            .map_err(|e| BrowserError::OperationError(e.to_string()))?;
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let handles = self
+            .client
+            .windows()
+            .await
+            .map_err(|e| BrowserError::OperationError(e.to_string()))?;
+
+        if let Some(handle) = handles.last() {
+            self.client
+                .switch_to_window(handle.clone())
+                .await
+                .map_err(|e| BrowserError::OperationError(e.to_string()))?;
+            self.current_tab = Some(handle.clone());
+        }
+
+        Ok(())
+    }
+
+    pub async fn switch_tab(&mut self, index: usize) -> Result<(), BrowserError> {
+        let handles = self
+            .client
+            .windows()
+            .await
+            .map_err(|e| BrowserError::OperationError(e.to_string()))?;
+
+        if let Some(handle) = handles.get(index) {
+            self.client
+                .switch_to_window(handle.clone())
+                .await
+                .map_err(|e| BrowserError::OperationError(e.to_string()))?;
+            self.current_tab = Some(handle.clone());
+            Ok(())
+        } else {
+            Err(BrowserError::OperationError(format!(
+                "No tab at index {} ({} tabs open)",
+                index,
+                handles.len()
+            )))
+        }
+    }
+
+    /// Close the tab at a specific index (switches to it first)
+    pub async fn close_tab(&mut self, index: usize) -> Result<(), BrowserError> {
+        let handles = self
+            .client
+            .windows()
+            .await
+            .map_err(|e| BrowserError::OperationError(e.to_string()))?;
+
+        if handles.len() <= 1 {
+            return Err(BrowserError::OperationError(
+                "Cannot close the only remaining tab".into(),
+            ));
+        }
+
+        if index >= handles.len() {
+            return Err(BrowserError::OperationError(format!(
+                "Tab index {} out of bounds ({} tabs open)",
+                index,
+                handles.len()
+            )));
+        }
+
+        // Switch to the tab we want to close
+        let handle_to_close = handles[index].clone();
+        self.client
+            .switch_to_window(handle_to_close.clone())
+            .await
+            .map_err(|e| BrowserError::OperationError(e.to_string()))?;
+
+        // Close it
+        self.client
+            .close_window()
+            .await
+            .map_err(|e| BrowserError::OperationError(e.to_string()))?;
+
+        // After closing, update current tab to the first remaining one
+        let remaining = self
+            .client
+            .windows()
+            .await
+            .map_err(|e| BrowserError::OperationError(e.to_string()))?;
+
+        self.current_tab = remaining.first().cloned();
+        Ok(())
+    }
+
+    pub async fn list_tabs(&mut self) -> Result<Vec<WindowHandle>, BrowserError> {
+        self.client
+            .windows()
+            .await
+            .map_err(|e| BrowserError::OperationError(e.to_string()))
+    }
+
+    pub fn current_tab_handle(&self) -> Option<&WindowHandle> {
+        self.current_tab.as_ref()
+    }
+
+    pub async fn wait_for_tab_ready(&mut self, wait_selector: &str) -> Result<(), BrowserError> {
+        // Wait for tab to become usable and element to exist
+        self.retry(|| async {
+            self.client
+                .wait()
+                .for_element(fantoccini::Locator::Css(wait_selector))
+                .await
+                .map(|_| ())
+                .map_err(|e| {
+                    BrowserError::OperationError(format!(
+                        "Page not ready (waiting for '{}'): {}",
+                        wait_selector, e
+                    ))
+                })
+        })
+        .await
     }
 
     pub async fn shutdown(self) -> Result<(), BrowserError> {
@@ -152,23 +378,62 @@ impl BrowserClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fantoccini::client;
     use tokio;
-    #[tokio::test]
-    async fn test_browser() {
-        let options = BrowserOptions::new().window_size(1920, 1080);
 
+    #[tokio::test]
+    async fn browser_client_test() {
+        let options = BrowserOptions::new();
         let mut client = BrowserClient::connect(options).await.unwrap();
 
-        client.search_duckduckgo("jordan 1s").await.unwrap();
+        let total_tabs = 4;
 
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        client.navigate("https://duckduckgo.com/").await.unwrap();
+
+        // Open and navigate tabs
+        for _ in 0..total_tabs {
+            client.open_tab().await.unwrap();
+            client.navigate("https://duckduckgo.com/").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        let mut handles = client.list_tabs().await.unwrap();
+
+        // Close all except the first tab (index 0)
+        while handles.len() > 1 {
+            // Always close the *last* one for safety
+            let last_index = handles.len() - 1;
+            client.close_tab(last_index).await.unwrap();
+
+            handles = client.list_tabs().await.unwrap(); // refresh handles
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        client.switch_tab(0).await.unwrap();
 
         client
-            .navigate("https://github.com/browser-use")
+            .send_keys_to_element("input[name='q']", "I am a robot!")
             .await
             .unwrap();
 
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        client
+            .click_element(".iconButton_size-20__Ql3lL")
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        client.back().await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        client.forward().await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let source = client.source().await.unwrap();
+
+        println!("{}", source);
 
         client.shutdown().await.unwrap();
     }
