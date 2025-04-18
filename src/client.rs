@@ -75,7 +75,6 @@ pub struct BrowserClient {
     pub client: Client,
     options: BrowserOptions,
     current_tab: Option<WindowHandle>,
-    action_retry_count: usize,
 }
 
 impl BrowserClient {
@@ -133,7 +132,6 @@ impl BrowserClient {
             client,
             options,
             current_tab,
-            action_retry_count: 3,
         })
     }
 
