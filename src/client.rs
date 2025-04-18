@@ -72,7 +72,7 @@ impl BrowserOptions {
 }
 
 pub struct BrowserClient {
-    client: Client,
+    pub client: Client,
     options: BrowserOptions,
     current_tab: Option<WindowHandle>,
     action_retry_count: usize,
@@ -137,24 +137,6 @@ impl BrowserClient {
         })
     }
 
-    async fn retry<F, Fut, T>(&self, mut f: F) -> Result<T, BrowserError>
-    where
-        F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = Result<T, BrowserError>>,
-    {
-        let mut attempts = 0;
-        loop {
-            match f().await {
-                Ok(result) => return Ok(result),
-                Err(e) if attempts < self.action_retry_count => {
-                    attempts += 1;
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
     pub async fn navigate(&mut self, url: &str) -> Result<(), BrowserError> {
         self.client
             .goto(url)
@@ -196,21 +178,18 @@ impl BrowserClient {
     pub async fn click_element(&mut self, selector: &str) -> Result<(), BrowserError> {
         self.wait_for_tab_ready(selector).await?;
 
-        self.retry(|| async {
-            let el = self
-                .client
-                .wait()
-                .for_element(fantoccini::Locator::Css(selector))
-                .await
-                .map_err(|e| {
-                    BrowserError::OperationError(format!("Failed to find '{}': {}", selector, e))
-                })?;
+        let el = self
+            .client
+            .wait()
+            .for_element(fantoccini::Locator::Css(selector))
+            .await
+            .map_err(|e| {
+                BrowserError::OperationError(format!("Failed to find '{}': {}", selector, e))
+            })?;
 
-            el.click().await.map_err(|e| {
-                BrowserError::OperationError(format!("Click failed '{}': {}", selector, e))
-            })
+        el.click().await.map_err(|e| {
+            BrowserError::OperationError(format!("Click failed '{}': {}", selector, e))
         })
-        .await
     }
 
     pub async fn send_keys_to_element(
@@ -220,21 +199,18 @@ impl BrowserClient {
     ) -> Result<(), BrowserError> {
         self.wait_for_tab_ready(selector).await?;
 
-        self.retry(|| async {
-            let el = self
-                .client
-                .wait()
-                .for_element(fantoccini::Locator::Css(selector))
-                .await
-                .map_err(|e| {
-                    BrowserError::OperationError(format!("Failed to find '{}': {}", selector, e))
-                })?;
+        let el = self
+            .client
+            .wait()
+            .for_element(fantoccini::Locator::Css(selector))
+            .await
+            .map_err(|e| {
+                BrowserError::OperationError(format!("Failed to find '{}': {}", selector, e))
+            })?;
 
-            el.send_keys(text).await.map_err(|e| {
-                BrowserError::OperationError(format!("Send keys failed '{}': {}", selector, e))
-            })
+        el.send_keys(text).await.map_err(|e| {
+            BrowserError::OperationError(format!("Send keys failed '{}': {}", selector, e))
         })
-        .await
     }
 
     pub async fn source(&mut self) -> Result<String, BrowserError> {
@@ -351,20 +327,17 @@ impl BrowserClient {
 
     pub async fn wait_for_tab_ready(&mut self, wait_selector: &str) -> Result<(), BrowserError> {
         // Wait for tab to become usable and element to exist
-        self.retry(|| async {
-            self.client
-                .wait()
-                .for_element(fantoccini::Locator::Css(wait_selector))
-                .await
-                .map(|_| ())
-                .map_err(|e| {
-                    BrowserError::OperationError(format!(
-                        "Page not ready (waiting for '{}'): {}",
-                        wait_selector, e
-                    ))
-                })
-        })
-        .await
+        self.client
+            .wait()
+            .for_element(fantoccini::Locator::Css(wait_selector))
+            .await
+            .map(|_| ())
+            .map_err(|e| {
+                BrowserError::OperationError(format!(
+                    "Page not ready (waiting for '{}'): {}",
+                    wait_selector, e
+                ))
+            })
     }
 
     pub async fn shutdown(self) -> Result<(), BrowserError> {
@@ -378,7 +351,6 @@ impl BrowserClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fantoccini::client;
     use tokio;
 
     #[tokio::test]
