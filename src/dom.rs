@@ -2,7 +2,7 @@ use crate::client::{BrowserClient, BrowserError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum ElementType {
     Clickable,
@@ -156,7 +156,7 @@ mod tests {
         let mut client = BrowserClient::connect(BrowserOptions::new()).await.unwrap();
 
         client
-            .navigate("https://duckduckgo.com")
+            .navigate("https://www.youtube.com/feed/trending?bp=4gIcGhpnYW1pbmdfY29ycHVzX21vc3RfcG9wdWxhcg%3D%3D")
             .await
             .expect("Navigation failed");
 
