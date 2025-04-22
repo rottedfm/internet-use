@@ -244,6 +244,48 @@ impl BrowserClient {
             .map_err(|e| BrowserError::OperationError(e.to_string()))
     }
 
+    /// Scrolls to a element on screen
+    pub async fn scroll_to(&mut self, selector: &str) -> Result<(), BrowserError> {
+        let js = r#"
+        const el = document.querySelector(arguments[0]);
+        if (el) {
+            el.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' });
+            return true;
+        }
+        return false;
+        "#;
+
+        let res = self.client
+            .execute(js, vec![serde_json::to_value(selector).unwrap()])
+            .await
+            .map_err(|e| BrowserError::OperationError(e.to_string()))?;
+        
+        match res.as_bool() {
+            Some(true) => Ok(()),
+            _ => Err(BrowserError::OperationError(format!("Element not found or failed to scroll: {selector}"))),
+        }
+    }
+
+    /// Capture a timestamped screenshot of the BrowserClient
+    pub async fn capture_screenshot(&mut self, output_dir: &Path, prefix: &str) -> Result<PathBuf, BrowserError> {
+        let timestamp = Local::now().format("%Y%m%d-%H%M%S%.3f");
+        let filename = format!("{prefix}-{timestamp}.png");
+        let path = output_dir.join(filename);
+
+        let png_data = self
+            .client
+            .screenshot()
+            .await
+            .map_err(|e| BrowserError::OperationError(e.to_string()))?;
+
+        fs::write(&path, &png_data)
+            .map_err(|e| BrowserError::OperationError(e.to_string()))?;
+
+        Ok(path)        
+        
+    }
+
+
     /// Opens a new browser tab and switches to it.
     pub async fn open_tab(&mut self) -> Result<(), BrowserError> {
         self.client
