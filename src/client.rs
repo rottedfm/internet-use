@@ -19,12 +19,18 @@ pub enum BrowserError {
     ConfigError(String),
 }
 
+/// Configuration options for intializing a browser session.
 #[derive(Debug, Clone, Serialize)]
 pub struct BrowserOptions {
+    /// Weather the browser should run in headless mode.
     pub headless: bool,
+    /// Optional window dimensions (width, height).
     pub window_size: Option<(u32, u32)>,
+    /// Optional proxy URL to use for HTTP/HTTPS traffic.
     pub proxy: Option<String>,
+    /// Optional user agent string override.
     pub user_agent: Option<String>,
+    /// Timeout for browser operations, in seconds.
     pub timeout: Duration,
 }
 
@@ -41,43 +47,54 @@ impl Default for BrowserOptions {
 }
 
 impl BrowserOptions {
+    /// Creates a new `BrowserOptions` instance with default values.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Sets headless mode (true = no UI).
     pub fn headless(mut self, enabled: bool) -> Self {
         self.headless = enabled;
         self
     }
 
+    /// Sets the browser window size.
     pub fn window_size(mut self, width: u32, height: u32) -> Self {
         self.window_size = Some((width, height));
         self
     }
 
+    /// Sets a proxy server for the browser session
     pub fn proxy(mut self, proxy_url: &str) -> Self {
         self.proxy = Some(proxy_url.to_string());
         self
     }
 
+    /// Overrides the browser's default user agent string.
     pub fn user_agent(mut self, ua: &str) -> Self {
         self.user_agent = Some(ua.to_string());
         self
     }
 
+    /// Sets the timeout for operations (in seconds).
     pub fn timeout(mut self, seconds: u64) -> Self {
         self.timeout = Duration::from_secs(seconds);
         self
     }
 }
 
+/// High-level browser automation client powered by 'fantoccini'.
 pub struct BrowserClient {
+    /// The underlying WebDriver client instance.
     pub client: Client,
+    /// Configuration options used to initialize the browser.
     options: BrowserOptions,
+    /// The current active tab/window handle.
     current_tab: Option<WindowHandle>,
 }
 
 impl BrowserClient {
+    /// Connects to the WebDriver server with the given options and returns a `BrowserClient`.
     pub async fn connect(options: BrowserOptions) -> Result<Self, BrowserError> {
         let mut caps = Capabilities::new();
 
@@ -135,6 +152,7 @@ impl BrowserClient {
         })
     }
 
+    /// Navigates the current tab to the given URL.
     pub async fn navigate(&mut self, url: &str) -> Result<(), BrowserError> {
         self.client
             .goto(url)
@@ -142,11 +160,13 @@ impl BrowserClient {
             .map_err(|e| BrowserError::OperationError(e.to_string()))
     }
 
+    /// Navigates to DuckDuckGo and performs a search with the given query.
     pub async fn search_duckduckgo(&mut self, query: &str) -> Result<(), BrowserError> {
         let url = format!("https://duckduckgo.com/?q={}", query);
         self.navigate(&url).await
     }
 
+    /// Navigates back in the browser history.
     pub async fn back(&mut self) -> Result<(), BrowserError> {
         self.client
             .back()
@@ -154,6 +174,7 @@ impl BrowserClient {
             .map_err(|e| BrowserError::OperationError(e.to_string()))
     }
 
+    /// Navigates forward in the browser history.
     pub async fn forward(&mut self) -> Result<(), BrowserError> {
         self.client
             .forward()
@@ -161,6 +182,8 @@ impl BrowserClient {
             .map_err(|e| BrowserError::OperationError(e.to_string()))
     }
 
+    /// Waits for an element matching the CSS selector to appear.
+    /// Returns `true` if found, `false` if it times out.
     pub async fn wait_for_element(&mut self, element: &str) -> Result<bool, BrowserError> {
         match self
             .client
@@ -173,8 +196,9 @@ impl BrowserClient {
         }
     }
 
+    /// Click an element matching the given CSS selector.
     pub async fn click_element(&mut self, selector: &str) -> Result<(), BrowserError> {
-        self.wait_for_tab_ready(selector).await?;
+        self.wait_for_selector(selector).await?;
 
         let el = self
             .client
@@ -190,12 +214,13 @@ impl BrowserClient {
         })
     }
 
+    /// Sends keys to an input or textarea matching the given selector.
     pub async fn send_keys_to_element(
         &mut self,
         selector: &str,
         text: &str,
     ) -> Result<(), BrowserError> {
-        self.wait_for_tab_ready(selector).await?;
+        self.wait_for_selector(selector).await?;
 
         let el = self
             .client
@@ -211,6 +236,7 @@ impl BrowserClient {
         })
     }
 
+    /// Returns the full page source HTML of the current tab.
     pub async fn source(&mut self) -> Result<String, BrowserError> {
         self.client
             .source()
@@ -218,6 +244,7 @@ impl BrowserClient {
             .map_err(|e| BrowserError::OperationError(e.to_string()))
     }
 
+    /// Opens a new browser tab and switches to it.
     pub async fn open_tab(&mut self) -> Result<(), BrowserError> {
         self.client
             .execute("window.open('about:blank', '_blank');", vec![])
@@ -243,6 +270,7 @@ impl BrowserClient {
         Ok(())
     }
 
+    /// Switches to the tab at the specified index.
     pub async fn switch_tab(&mut self, index: usize) -> Result<(), BrowserError> {
         let handles = self
             .client
@@ -266,7 +294,9 @@ impl BrowserClient {
         }
     }
 
-    /// Close the tab at a specific index (switches to it first)
+    /// Close the tab at the specified index and updates the current tab handle.
+    ///
+    /// Fails if only one tab is open or if the index is invaild.
     pub async fn close_tab(&mut self, index: usize) -> Result<(), BrowserError> {
         let handles = self
             .client
@@ -288,7 +318,6 @@ impl BrowserClient {
             )));
         }
 
-        // Switch to the tab we want to close
         let handle_to_close = handles[index].clone();
         self.client
             .switch_to_window(handle_to_close.clone())
@@ -301,7 +330,6 @@ impl BrowserClient {
             .await
             .map_err(|e| BrowserError::OperationError(e.to_string()))?;
 
-        // After closing, update current tab to the first remaining one
         let remaining = self
             .client
             .windows()
@@ -312,6 +340,7 @@ impl BrowserClient {
         Ok(())
     }
 
+    /// Returns a list of all open window handles (tabs).
     pub async fn list_tabs(&mut self) -> Result<Vec<WindowHandle>, BrowserError> {
         self.client
             .windows()
@@ -319,12 +348,13 @@ impl BrowserClient {
             .map_err(|e| BrowserError::OperationError(e.to_string()))
     }
 
+    /// Returns the current tab's window handle, if available.
     pub fn current_tab_handle(&self) -> Option<&WindowHandle> {
         self.current_tab.as_ref()
     }
 
-    pub async fn wait_for_tab_ready(&mut self, wait_selector: &str) -> Result<(), BrowserError> {
-        // Wait for tab to become usable and element to exist
+    /// Waits for a specific CSS selector to be present in the current tab.
+    pub async fn wait_for_selector(&mut self, wait_selector: &str) -> Result<(), BrowserError> {
         self.client
             .wait()
             .for_element(fantoccini::Locator::Css(wait_selector))
@@ -338,6 +368,7 @@ impl BrowserClient {
             })
     }
 
+    /// Shuts down the browser session and closes the webdriver.
     pub async fn shutdown(self) -> Result<(), BrowserError> {
         self.client
             .close()

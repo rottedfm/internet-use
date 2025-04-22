@@ -166,6 +166,49 @@ Respond with exactly one word: "click" or "type"
 
         self.prompt_for_label(instruction, &filtered).await
     }
+
+    pub async fn evaluate_action(
+        &self,
+        instruction: &str,
+        before: &[InteractiveElement],
+        after: &[InteractiveElement],
+    ) -> Result<bool, String> {
+        let before_summary = Self::summarize_elements(before);
+        let after_summary = Self::summarize_elements(after);
+
+        let prompt = format!(
+            r#"
+Instruction: "{instruction}"
+
+Before:
+{before_summary}
+
+After:
+{after_summary}
+
+Did the action fulfill the instruction? Respond with YES or NO.
+            "#
+        );
+
+        let response = self.ask(&prompt).await?;
+        Ok(response.trim().to_lowercase().starts_with("yes"))
+    }
+
+    fn summarize_elements(elements: &[InteractiveElement]) -> String {
+        elements
+            .iter()
+            .map(|el| {
+                format!(
+                    "[{}] <{}> \"{}\" ({})",
+                    el.label.clone().unwrap_or("?".into()),
+                    el.tag,
+                    el.text.clone().unwrap_or_default(),
+                    el.selector
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 #[cfg(test)]
@@ -176,50 +219,83 @@ mod tests {
     use tokio;
 
     #[tokio::test]
-    async fn test_agent_decide_label() {
-        let mut browser = BrowserClient::connect(BrowserOptions::new()).await.unwrap();
+    async fn test_agent_retries_until_success() {
+        let mut browser = BrowserClient::connect(BrowserOptions::new().window_size(3440, 1440))
+            .await
+            .unwrap();
+        let agent = Agent::new("qwen2.5-coder:7b")
+            .with_temperature(0.2)
+            .with_label_attempts(5);
 
+        let instruction = "Click a ww3 video!";
         browser
             .navigate("https://www.youtube.com/feed/trending?bp=6gQJRkVleHBsb3Jl")
             .await
             .unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        let max_attempts = 5;
 
-        let elements = extract_interactive_elements(&mut browser).await.unwrap();
+        for attempt in 1..=max_attempts {
+            println!("[Attempt {}/{}]", attempt, max_attempts);
 
-        assert!(!elements.is_empty(), "No interactive elements found!");
+            let before_elements = extract_interactive_elements(&mut browser)
+                .await
+                .expect("Failed to extract before DOM");
 
-        let agent = Agent::new("llama3.2")
-            .with_temperature(0.4)
-            .with_label_attempts(5);
+            let label_result = agent.decide_label(instruction, &before_elements).await;
+            if label_result.is_err() {
+                println!("Agent couldn't decide on a label: {:?}", label_result.err());
+                continue;
+            }
+            let label = label_result.unwrap();
 
-        let instruction = "Find a movie trailer and click on it.";
+            let target = before_elements
+                .iter()
+                .find(|el| el.label.as_deref() == Some(&label));
 
-        let label = agent.decide_label(instruction, &elements).await.unwrap();
+            if let Some(element) = target {
+                println!("Attempting to click selector: {}", element.selector);
+                if browser.click_element(&element.selector).await.is_err() {
+                    println!("Click failed, retrying...");
+                    continue;
+                }
+            } else {
+                println!("Label not found in current DOM, retrying...");
+                continue;
+            }
 
-        println!("Instruction: {}", instruction);
-        println!("Selected label: {}", label);
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-        let found = elements
-            .iter()
-            .find(|el| el.label.as_deref() == Some(&label))
-            .expect("Returned label not found in DOM");
+            let after_elements = extract_interactive_elements(&mut browser)
+                .await
+                .expect("Failed to extract after DOM");
 
-        println!(
-            "Matched element: <{}> - {}",
-            found.tag,
-            found.text.clone().unwrap_or_default()
-        );
+            let fulfilled = agent
+                .evaluate_action(instruction, &before_elements, &after_elements)
+                .await
+                .unwrap_or(false);
 
-        // Optionally click the element (if clickable)
-        if found.element_type == ElementType::Clickable {
-            browser.click_element(&found.selector).await.unwrap();
-            println!("Clicked element with selector: {}", &found.selector);
+            if fulfilled {
+                println!(
+                    "✅ Instruction successfully fulfilled on attempt {}",
+                    attempt
+                );
+                assert!(true);
+                browser.shutdown().await.unwrap();
+                return;
+            } else {
+                println!("⚠️ Action did not fulfill instruction, retrying...");
+            }
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-
-        browser.shutdown().await.expect("Browser shutdown failed");
+        println!(
+            "❌ Failed to fulfill instruction after {} attempts.",
+            max_attempts
+        );
+        assert!(
+            false,
+            "Agent could not fulfill the instruction after retries"
+        );
     }
 }
