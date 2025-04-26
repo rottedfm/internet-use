@@ -1,6 +1,6 @@
 use chrono;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use thiserror::Error;
 
 /// Memory-related errors.
