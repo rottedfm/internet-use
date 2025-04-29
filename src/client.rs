@@ -1,16 +1,14 @@
+use chrono::{Local, format};
 use fantoccini::{
     Client, ClientBuilder,
     wd::{Capabilities, WindowHandle},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
-use thiserror::Error;
-use chrono::Local;
-use tokio::time::Duration;
-use std::path::{Path, PathBuf};
 use std::fs;
-
-
+use std::path::{Path, PathBuf};
+use thiserror::Error;
+use tokio::time::Duration;
 
 #[derive(Debug, Error)]
 pub enum BrowserError {
@@ -22,6 +20,31 @@ pub enum BrowserError {
 
     #[error("Invalid browser configuration: {0}")]
     ConfigError(String),
+
+    #[error("Failed to extract elements: {0}")]
+    DomExtractionError(String),
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
+pub enum InteractiveElementType {
+    Clickable,
+    Typable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextElement {
+    pub selector: String,
+    pub text: String,
+    pub index: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct InteractiveElement {
+    pub selector: String,
+    pub tag: String,
+    pub text: String,
+    pub r#type: String,
+    pub placeholder: String,
 }
 
 /// Configuration options for intializing a browser session.
@@ -157,8 +180,235 @@ impl BrowserClient {
         })
     }
 
+    /// Extracts clickable, typeable, text elements, and highlights and labelss
+    /// Extracts clickable, typeable, and text elements, while also highlighting them on the page.
+    pub async fn extract_elements_with_text(
+        &self,
+    ) -> Result<(Vec<InteractiveElement>, Vec<TextElement>), BrowserError> {
+        let script = r##"
+(() => {
+    const interactive = [];
+    const texts = [];
+    let index = 1;
+    let letterCode = 65; // 'A'
+
+    function lightYellowColor() {
+        return `rgba(255, 255, 153, 0.5)`; // light yellow
+    }
+
+    function getNextLetter() {
+        const letter = String.fromCharCode(letterCode);
+        letterCode++;
+        if (letterCode > 90) letterCode = 65;
+        return letter;
+    }
+
+    function generateUniqueSelector(el) {
+        if (!(el instanceof Element)) return "";
+        const path = [];
+        while (el.nodeType === Node.ELEMENT_NODE) {
+            let selector = el.nodeName.toLowerCase();
+            if (el.id) {
+                selector += "#" + el.id;
+                path.unshift(selector);
+                break;
+            } else {
+                let sibling = el;
+                let siblingIndex = 1;
+                while ((sibling = sibling.previousElementSibling)) {
+                    if (sibling.nodeName.toLowerCase() === selector)
+                        siblingIndex++;
+                }
+                if (siblingIndex > 1) {
+                    selector += ":nth-of-type(" + siblingIndex + ")";
+                }
+            }
+            path.unshift(selector);
+            el = el.parentNode;
+        }
+        return path.join(" > ");
+    }
+
+    // --- Global Info Panel ---
+    const infoPanel = document.createElement("div");
+    infoPanel.style.position = "fixed";
+    infoPanel.style.top = "10px";
+    infoPanel.style.right = "10px";
+    infoPanel.style.width = "300px";
+    infoPanel.style.maxHeight = "400px";
+    infoPanel.style.overflowY = "auto";
+    infoPanel.style.background = "rgba(255, 255, 255, 0.05)";
+    infoPanel.style.color = "red";
+    infoPanel.style.border = "2px solid red";
+    infoPanel.style.borderRadius = "0px"; // square
+    infoPanel.style.padding = "10px";
+    infoPanel.style.boxShadow = "0 4px 12px rgba(0,0,0,0.15)";
+    infoPanel.style.fontSize = "12px";
+    infoPanel.style.zIndex = "10000";
+    infoPanel.style.display = "none";
+    infoPanel.style.transition = "opacity 0.2s, background 0.2s";
+    document.body.appendChild(infoPanel);
+
+    let hideTimer = null;
+
+    function showInfo(content) {
+        clearTimeout(hideTimer);
+        infoPanel.innerHTML = content;
+        infoPanel.style.display = "block";
+        infoPanel.style.opacity = "1";
+    }
+
+    function hideInfo() {
+        hideTimer = setTimeout(() => {
+            infoPanel.style.opacity = "0";
+            setTimeout(() => {
+                infoPanel.style.display = "none";
+            }, 200);
+        }, 250);
+    }
+
+    function attachHoverEvents(target, infoContent, type) {
+        target.addEventListener("mouseenter", () => {
+            showInfo(infoContent);
+            target.style.zIndex = "9999";
+            if (type === "interactive") {
+                target.style.border = "2px solid red";
+            } else if (type === "text") {
+                target.style.backgroundColor = lightYellowColor();
+            }
+        });
+        target.addEventListener("mouseleave", () => {
+            hideInfo();
+            target.style.zIndex = "";
+            if (type === "interactive") {
+                target.style.border = "";
+            } else if (type === "text") {
+                target.style.backgroundColor = "";
+            }
+        });
+    }
+
+    // --- Step 1: clickable elements ---
+    const allInteractiveElements = document.querySelectorAll("button, a, input, textarea, [onclick]");
+    for (const el of allInteractiveElements) {
+        el.style.position = "relative"; // for z-index stacking
+
+        const selector = generateUniqueSelector(el);
+        const label = `[${getNextLetter()}]`;
+
+        const infoContent = `
+            <strong>Interactive Element</strong><br/>
+            Label: ${label}<br/>
+            Selector: <code>${selector}</code><br/>
+            Tag: ${el.tagName}<br/>
+            Type: ${el.getAttribute("type") || "N/A"}<br/>
+            Placeholder: ${el.getAttribute("placeholder") || "N/A"}
+        `;
+        attachHoverEvents(el, infoContent, "interactive");
+
+        interactive.push({
+            selector,
+            tag: el.tagName,
+            text: el.innerText.trim(),
+            type: el.getAttribute("type") || "",
+            placeholder: el.getAttribute("placeholder") || ""
+        });
+    }
+
+    // --- Step 2: text blocks ---
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+        acceptNode: function(node) {
+            if (node.parentNode &&
+                node.parentNode.nodeName !== "SCRIPT" &&
+                node.parentNode.nodeName !== "STYLE" &&
+                node.textContent.trim().length > 0) {
+                return NodeFilter.FILTER_ACCEPT;
+            }
+            return NodeFilter.FILTER_REJECT;
+        }
+    });
+
+    const parentMap = new Map();
+    let node = walker.nextNode();
+
+    while (node) {
+        const parent = node.parentNode;
+        if (!parentMap.has(parent)) {
+            parentMap.set(parent, []);
+        }
+        parentMap.get(parent).push(node);
+        node = walker.nextNode();
+    }
+
+    for (const [parent, nodes] of parentMap.entries()) {
+        const fullText = nodes.map(n => n.textContent.trim()).join(" ").trim();
+        if (fullText.length === 0) continue;
+
+        const wrapper = document.createElement("span");
+        wrapper.style.borderRadius = "4px";
+        wrapper.style.padding = "2px 6px";
+        wrapper.style.margin = "1px";
+        wrapper.style.display = "inline-block";
+        wrapper.style.cursor = "pointer";
+
+        const selector = generateUniqueSelector(parent);
+        const label = `[${index}]`;
+
+        const infoContent = `
+            <strong>Text Block</strong><br/>
+            Label: ${label}<br/>
+            Selector: <code>${selector}</code><br/>
+            Content: ${fullText}
+        `;
+        attachHoverEvents(wrapper, infoContent, "text");
+
+        const textNode = document.createTextNode(fullText);
+        wrapper.appendChild(textNode);
+
+        for (const n of nodes) {
+            parent.removeChild(n);
+        }
+        parent.insertBefore(wrapper, parent.firstChild);
+
+        texts.push({
+            selector,
+            text: fullText,
+            index: index
+        });
+
+        index++;
+    }
+
+    return { interactive, texts };
+})();
+"##;
+
+        let res = self
+            .client
+            .execute(script, vec![])
+            .await
+            .map_err(|e| BrowserError::DomExtractionError(e.to_string()))?;
+
+        let result = res.clone();
+
+        let interactive = result
+            .get("interactive")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
+        let texts = result
+            .get("texts")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
+        Ok((interactive, texts))
+    }
+
     /// Navigates the current tab to the given URL.
     pub async fn navigate(&mut self, url: &str) -> Result<(), BrowserError> {
+        self.push_browser_log(&format!("Navigating to {}", url))
+            .await?;
+
         self.client
             .goto(url)
             .await
@@ -168,11 +418,14 @@ impl BrowserClient {
     /// Navigates to DuckDuckGo and performs a search with the given query.
     pub async fn search_duckduckgo(&mut self, query: &str) -> Result<(), BrowserError> {
         let url = format!("https://duckduckgo.com/?q={}", query);
+        self.push_browser_log(&format!("Searching DuckDuckGo for '{}'", query))
+            .await?;
         self.navigate(&url).await
     }
 
     /// Navigates back in the browser history.
     pub async fn back(&mut self) -> Result<(), BrowserError> {
+        self.push_browser_log("Navigating back").await?;
         self.client
             .back()
             .await
@@ -181,10 +434,63 @@ impl BrowserClient {
 
     /// Navigates forward in the browser history.
     pub async fn forward(&mut self) -> Result<(), BrowserError> {
+        self.push_browser_log("Navigating forward").await?;
         self.client
             .forward()
             .await
             .map_err(|e| BrowserError::OperationError(e.to_string()))
+    }
+
+    /// Pushes a new message into the floating browser log panel.
+    pub async fn push_browser_log(&self, message: &str) -> Result<(), BrowserError> {
+        let script = r#"
+(() => {
+    if (!window.pushBrowserLog) {
+        const logContainer = document.createElement("div");
+        logContainer.id = "browser-log";
+        logContainer.style.position = "fixed";
+        logContainer.style.top = "10px";
+        logContainer.style.left = "10px";
+        logContainer.style.width = "500px"; // Expanded width
+        logContainer.style.maxHeight = "500px";
+        logContainer.style.overflowY = "auto";
+        logContainer.style.background = "rgba(0, 0, 0, 0.05)"; // Slight dark transparent background
+        logContainer.style.color = "red";
+        logContainer.style.fontSize = "12px";
+        logContainer.style.padding = "10px";
+        logContainer.style.zIndex = "99999";
+        logContainer.style.border = "none"; 
+        logContainer.style.borderRadius = "0px"; 
+        logContainer.style.pointerEvents = "none"; // Doesn't block clicks
+        logContainer.style.fontFamily = "monospace";
+        logContainer.style.boxShadow = "0 4px 12px rgba(0,0,0,0.2)";
+        document.body.appendChild(logContainer);
+
+        window.pushBrowserLog = function(msg) {
+            const timestamp = new Date().toISOString().split('T')[1].split('.')[0];
+            const entry = document.createElement("div");
+            entry.style.padding = "2px 0"; // Tight log spacing
+            entry.style.margin = "1px 0";
+            entry.style.fontFamily = "monospace";
+            entry.style.whiteSpace = "pre-wrap";
+            entry.style.color = "red"; // Red text
+            entry.textContent = `[${timestamp}] ${msg}`;
+            logContainer.appendChild(entry);
+
+            // Only scroll after 15 entries
+            if (logContainer.childElementCount > 5) {
+                logContainer.scrollTop = logContainer.scrollHeight;
+            }
+        };
+    }
+    window.pushBrowserLog(arguments[0]);
+})();
+"#;
+        self.client
+            .execute(script, vec![json!(message)])
+            .await
+            .map(|_| ())
+            .map_err(|e| BrowserError::OperationError(format!("Failed to push browser log: {}", e)))
     }
 
     /// Waits for an element matching the CSS selector to appear.
@@ -203,6 +509,8 @@ impl BrowserClient {
 
     /// Click an element matching the given CSS selector.
     pub async fn click_element(&mut self, selector: &str) -> Result<(), BrowserError> {
+        self.push_browser_log(&format!("Clicking element '{}'", selector))
+            .await?;
         self.wait_for_selector(selector).await?;
 
         let el = self
@@ -225,6 +533,8 @@ impl BrowserClient {
         selector: &str,
         text: &str,
     ) -> Result<(), BrowserError> {
+        self.push_browser_log(&format!("Typing '{}' into '{}'", text, selector))
+            .await?;
         self.wait_for_selector(selector).await?;
 
         let el = self
@@ -251,6 +561,8 @@ impl BrowserClient {
 
     /// Scrolls to a element on screen
     pub async fn scroll_to(&mut self, selector: &str) -> Result<(), BrowserError> {
+        self.push_browser_log(&format!("Scrolling to '{}'", selector))
+            .await?;
         let js = r#"
         const el = document.querySelector(arguments[0]);
         if (el) {
@@ -260,19 +572,26 @@ impl BrowserClient {
         return false;
         "#;
 
-        let res = self.client
+        let res = self
+            .client
             .execute(js, vec![serde_json::to_value(selector).unwrap()])
             .await
             .map_err(|e| BrowserError::OperationError(e.to_string()))?;
-        
+
         match res.as_bool() {
             Some(true) => Ok(()),
-            _ => Err(BrowserError::OperationError(format!("Element not found or failed to scroll: {selector}"))),
+            _ => Err(BrowserError::OperationError(format!(
+                "Element not found or failed to scroll: {selector}"
+            ))),
         }
     }
 
     /// Capture a timestamped screenshot of the BrowserClient
-    pub async fn capture_screenshot(&mut self, output_dir: &Path, prefix: &str) -> Result<PathBuf, BrowserError> {
+    pub async fn capture_screenshot(
+        &mut self,
+        output_dir: &Path,
+        prefix: &str,
+    ) -> Result<PathBuf, BrowserError> {
         let timestamp = Local::now().format("%Y%m%d-%H%M%S%.3f");
         let filename = format!("{prefix}-{timestamp}.png");
         let path = output_dir.join(filename);
@@ -283,16 +602,14 @@ impl BrowserClient {
             .await
             .map_err(|e| BrowserError::OperationError(e.to_string()))?;
 
-        fs::write(&path, &png_data)
-            .map_err(|e| BrowserError::OperationError(e.to_string()))?;
+        fs::write(&path, &png_data).map_err(|e| BrowserError::OperationError(e.to_string()))?;
 
-        Ok(path)        
-        
+        Ok(path)
     }
-
 
     /// Opens a new browser tab and switches to it.
     pub async fn open_tab(&mut self) -> Result<(), BrowserError> {
+        self.push_browser_log("Opening new tab").await?;
         self.client
             .execute("window.open('about:blank', '_blank');", vec![])
             .await
@@ -319,6 +636,9 @@ impl BrowserClient {
 
     /// Switches to the tab at the specified index.
     pub async fn switch_tab(&mut self, index: usize) -> Result<(), BrowserError> {
+        self.push_browser_log(&format!("Switching to tab {}", index))
+            .await?;
+
         let handles = self
             .client
             .windows()
@@ -345,6 +665,9 @@ impl BrowserClient {
     ///
     /// Fails if only one tab is open or if the index is invaild.
     pub async fn close_tab(&mut self, index: usize) -> Result<(), BrowserError> {
+        self.push_browser_log(&format!("Closing tab {}", index))
+            .await?;
+
         let handles = self
             .client
             .windows()
@@ -414,7 +737,6 @@ impl BrowserClient {
                 ))
             })
     }
-
     /// Shuts down the browser session and closes the webdriver.
     pub async fn shutdown(self) -> Result<(), BrowserError> {
         self.client
@@ -428,61 +750,45 @@ impl BrowserClient {
 mod tests {
     use super::*;
     use tokio;
-
     #[tokio::test]
-    async fn browser_client_test() {
-        let options = BrowserOptions::new();
+    async fn browser_extract_elements_test() {
+        let options = BrowserOptions::new().headless(false);
         let mut client = BrowserClient::connect(options).await.unwrap();
-
-        let total_tabs = 4;
 
         client.navigate("https://duckduckgo.com/").await.unwrap();
 
-        // Open and navigate tabs
-        for _ in 0..total_tabs {
-            client.open_tab().await.unwrap();
-            client.navigate("https://duckduckgo.com/").await.unwrap();
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
-        let mut handles = client.list_tabs().await.unwrap();
+        let (interactive_elements, text_elements) =
+            client.extract_elements_with_text().await.unwrap();
 
-        // Close all except the first tab (index 0)
-        while handles.len() > 1 {
-            // Always close the *last* one for safety
-            let last_index = handles.len() - 1;
-            client.close_tab(last_index).await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
 
-            handles = client.list_tabs().await.unwrap(); // refresh handles
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-
-        client.switch_tab(0).await.unwrap();
+        client.click_element("#searchbox_input").await.unwrap();
 
         client
-            .send_keys_to_element("input[name='q']", "I am a robot!")
+            .send_keys_to_element("#searchbox_input", "Minecraft Movie")
             .await
             .unwrap();
 
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
         client
-            .click_element(".iconButton_size-20__Ql3lL")
+            .click_element("button.iconButton_button__A_Uiu:nth-child(2)")
             .await
             .unwrap();
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+        client.navigate("https://github.com/").await.unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
         client.back().await.unwrap();
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        client.forward().await.unwrap();
-
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        let source = client.source().await.unwrap();
-
-        println!("{}", source);
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
         client.shutdown().await.unwrap();
+        println!("✅ Shutdown cleanly.");
     }
 }
